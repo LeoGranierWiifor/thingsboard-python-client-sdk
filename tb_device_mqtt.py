@@ -106,6 +106,14 @@ class TBSendMethod(Enum):
     PUBLISH = 1
     UNSUBSCRIBE = 2
 
+class TBFirmwareState(Enum):
+        IDLE = "IDLE"
+        DOWNLOADING = "DOWNLOADING"
+        DOWNLOADED = "DOWNLOADED"
+        VERIFIED =  "VERIFIED"
+        UPDATING = "UPDATING"
+        UPDATED = "UPDATED"
+        FAILED = "FAILED"
 
 class TBPublishInfo:
     TB_ERR_AGAIN = -1
@@ -474,7 +482,7 @@ class TBDeviceMqttClient:
     def __init__(self, host, port=1883, username=None, password=None, quality_of_service=None, client_id="",
                  chunk_size=0, messages_rate_limit="DEFAULT_MESSAGES_RATE_LIMIT",
                  telemetry_rate_limit="DEFAULT_TELEMETRY_RATE_LIMIT",
-                 telemetry_dp_rate_limit="DEFAULT_TELEMETRY_DP_RATE_LIMIT", max_payload_size=8196, **kwargs):
+                 telemetry_dp_rate_limit="DEFAULT_TELEMETRY_DP_RATE_LIMIT", max_payload_size=8196, on_firmware_received=None, **kwargs):
         # Added for compatibility with old versions
         if kwargs.get('rate_limit') is not None or kwargs.get('dp_rate_limit') is not None:
             messages_rate_limit = messages_rate_limit if kwargs.get('rate_limit') == "DEFAULT_RATE_LIMIT" else kwargs.get('rate_limit', messages_rate_limit) # noqa
@@ -523,7 +531,7 @@ class TBDeviceMqttClient:
         self.current_firmware_info = {
             "current_" + FW_TITLE_ATTR: "Initial",
             "current_" + FW_VERSION_ATTR: "v0",
-            FW_STATE_ATTR: "IDLE"
+            FW_STATE_ATTR: TBFirmwareState.IDLE.value
         }
         self.__request_id = 0
         self.__firmware_request_id = 0
@@ -536,6 +544,26 @@ class TBDeviceMqttClient:
         self.__messages_limit_reached_set_time = (0,0)
         self.__datapoints_limit_reached_set_time = (0,0)
 
+        if on_firmware_received is not None:
+            self.__on_firmware_received = on_firmware_received 
+        else:
+            self.__on_firmware_received = self.__on_firmware_received_default
+
+    def update_firmware_info(self, title = None, version = None, state: TBFirmwareState = None):
+        if title is not None:
+            self.current_firmware_info["current_" + FW_TITLE_ATTR] = title
+        
+        if version is not None:
+            self.current_firmware_info["current_" + FW_VERSION_ATTR] = version
+
+        if state is not None:
+            self.current_firmware_info[FW_STATE_ATTR] = state.value
+
+        self.send_telemetry(self.current_firmware_info)
+
+    def set_on_firmware_received_function(self, on_firmware_received):
+        self.__on_firmware_received = on_firmware_received
+
     def __service_loop(self):
         while not self.stopped:
             if self.__request_service_configuration_required:
@@ -546,14 +574,8 @@ class TBDeviceMqttClient:
                 self.send_telemetry(self.current_firmware_info)
                 sleep(1)
 
-                self.__on_firmware_received(self.firmware_info.get(FW_VERSION_ATTR))
+                self.__on_firmware_received(self.firmware_data, self.firmware_info.get(FW_VERSION_ATTR))
 
-                self.current_firmware_info = {
-                    "current_" + FW_TITLE_ATTR: self.firmware_info.get(FW_TITLE_ATTR),
-                    "current_" + FW_VERSION_ATTR: self.firmware_info.get(FW_VERSION_ATTR),
-                    FW_STATE_ATTR: "UPDATED"
-                }
-                self.send_telemetry(self.current_firmware_info)
                 self.firmware_received = False
             sleep(0.05)
 
@@ -796,10 +818,18 @@ class TBDeviceMqttClient:
             f"v2/fw/request/{self.__firmware_request_id}/chunk/{self.__current_chunk}",
             payload=payload, qos=1)
 
-    def __on_firmware_received(self, version_to):
+    def __on_firmware_received_default(self, firmware_data, version_to):
         with open(self.firmware_info.get(FW_TITLE_ATTR), "wb") as firmware_file:
-            firmware_file.write(self.firmware_data)
-        log.info('Firmware is updated!\n Current firmware version is: %s' % version_to)
+            firmware_file.write(firmware_data)
+        log.warning(f"Firmware was received and stored under {self.firmware_info.get(FW_TITLE_ATTR)}," 
+                        "but 'on_firmware_received' callback is not defined. No OTA update applied." 
+                        "Call 'set_on_firmware_received_function' to handle properly firmware update.")
+        self.current_firmware_info = {
+                    "current_" + FW_TITLE_ATTR: self.firmware_info.get(FW_TITLE_ATTR),
+                    "current_" + FW_VERSION_ATTR: self.firmware_info.get(FW_VERSION_ATTR),
+                    FW_STATE_ATTR: "UPDATED"
+                }
+        self.send_telemetry(self.current_firmware_info)
 
     @staticmethod
     def _decode(message):
