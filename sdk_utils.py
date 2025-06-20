@@ -78,8 +78,4 @@ def verify_checksum(firmware_data, checksum_alg, checksum):
     else:
         log.error('Client error. Unsupported checksum algorithm.')
     log.debug(checksum_of_received_firmware)
-    random_value = randint(0, 5)
-    if random_value > 3:
-        log.debug('Dummy fail! Do not panic, just restart and try again the chance of this fail is ~20%')
-        return False
     return checksum_of_received_firmware == checksum
