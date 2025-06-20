@@ -560,11 +560,11 @@ class TBDeviceMqttClient:
         if state is not None:
             self.current_firmware_info[FW_STATE_ATTR] = state.value
             if state is TBFirmwareState.FAILED and error is not None:
-                self.current_firmware_info["current_" + FW_ERROR_ATTR] = error
+                self.current_firmware_info[FW_ERROR_ATTR] = error
 
         self.send_telemetry(self.current_firmware_info)
 
-        del self.current_firmware_info["current_" + FW_ERROR_ATTR]
+        self.current_firmware_info.pop("current_" + FW_ERROR_ATTR, None)
 
     def set_on_firmware_received_function(self, on_firmware_received):
         self.__on_firmware_received = on_firmware_received
@@ -575,8 +575,7 @@ class TBDeviceMqttClient:
                 self.request_service_configuration(self.service_configuration_callback)
                 self.__request_service_configuration_required = False
             elif self.firmware_received:
-                self.current_firmware_info[FW_STATE_ATTR] = "UPDATING"
-                self.send_telemetry(self.current_firmware_info)
+                self.update_firmware_info(state = TBFirmwareState.UPDATING)
                 sleep(1)
 
                 self.__on_firmware_received(self.firmware_data, self.firmware_info.get(FW_VERSION_ATTR))
@@ -785,8 +784,7 @@ class TBDeviceMqttClient:
                 self.firmware_data = b''
                 self.__current_chunk = 0
 
-                self.current_firmware_info[FW_STATE_ATTR] = "DOWNLOADING"
-                self.send_telemetry(self.current_firmware_info)
+                self.update_firmware_info(state = TBFirmwareState.DOWNLOADING)
                 sleep(1)
 
                 self.__firmware_request_id = self.__firmware_request_id + 1
@@ -796,8 +794,7 @@ class TBDeviceMqttClient:
                 self.__get_firmware()
 
     def __process_firmware(self):
-        self.current_firmware_info[FW_STATE_ATTR] = "DOWNLOADED"
-        self.send_telemetry(self.current_firmware_info)
+        self.update_firmware_info(state = TBFirmwareState.DOWNLOADED)
         sleep(1)
 
         verification_result = verify_checksum(self.firmware_data, self.firmware_info.get(FW_CHECKSUM_ALG_ATTR),
@@ -805,15 +802,11 @@ class TBDeviceMqttClient:
 
         if verification_result:
             log.debug('Checksum verified!')
-            self.current_firmware_info[FW_STATE_ATTR] = "VERIFIED"
-            self.send_telemetry(self.current_firmware_info)
+            self.update_firmware_info(state = TBFirmwareState.VERIFIED)
             sleep(1)
         else:
             log.debug('Checksum verification failed!')
-            self.current_firmware_info[FW_STATE_ATTR] = "FAILED"
-            self.current_firmware_info[FW_ERROR_ATTR] = "Checksum verification failed!"
-            self.send_telemetry(self.current_firmware_info)
-            del self.current_firmware_info[FW_ERROR_ATTR]
+            self.update_firmware_info(state = TBFirmwareState.FAILED, error = "Checksum verification failed!")
             self.__request_firmware_info()
             return
         self.firmware_received = True
@@ -831,12 +824,10 @@ class TBDeviceMqttClient:
         log.warning(f"Firmware was received and stored under {self.firmware_info.get(FW_TITLE_ATTR)}," 
                         "but 'on_firmware_received' callback is not defined. No OTA update applied." 
                         "Call 'set_on_firmware_received_function' to handle properly firmware update.")
-        self.current_firmware_info = {
-                    "current_" + FW_TITLE_ATTR: self.firmware_info.get(FW_TITLE_ATTR),
-                    "current_" + FW_VERSION_ATTR: self.firmware_info.get(FW_VERSION_ATTR),
-                    FW_STATE_ATTR: "UPDATED"
-                }
-        self.send_telemetry(self.current_firmware_info)
+
+        self.update_firmware_info(title = self.firmware_info.get(FW_TITLE_ATTR),
+                             version = self.firmware_info.get(FW_VERSION_ATTR),
+                             state = TBFirmwareState.UPDATED)
 
     @staticmethod
     def _decode(message):
