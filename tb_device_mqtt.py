@@ -69,7 +69,18 @@ FW_SIZE_ATTR = "fw_size"
 FW_STATE_ATTR = "fw_state"
 FW_ERROR_ATTR = "fw_error"
 
+SW_TITLE_ATTR = "sw_title"
+SW_VERSION_ATTR = "sw_version"
+SW_CHECKSUM_ATTR = "sw_checksum"
+SW_CHECKSUM_ALG_ATTR = "sw_checksum_algorithm"
+SW_SIZE_ATTR = "sw_size"
+SW_STATE_ATTR = "sw_state"
+SW_ERROR_ATTR = "sw_error"
+
 REQUIRED_SHARED_KEYS = f"{FW_CHECKSUM_ATTR},{FW_CHECKSUM_ALG_ATTR},{FW_SIZE_ATTR},{FW_TITLE_ATTR},{FW_VERSION_ATTR}"
+REQUIRED_SW_SHARED_KEYS = (
+    f"{SW_CHECKSUM_ATTR},{SW_CHECKSUM_ALG_ATTR},{SW_SIZE_ATTR},{SW_TITLE_ATTR},{SW_VERSION_ATTR}"
+)
 
 RPC_RESPONSE_TOPIC = 'v1/devices/me/rpc/response/'
 RPC_REQUEST_TOPIC = 'v1/devices/me/rpc/request/'
@@ -115,6 +126,10 @@ class TBFirmwareState(Enum):
         UPDATING = "UPDATING"
         UPDATED = "UPDATED"
         FAILED = "FAILED"
+
+
+# Software OTA uses the same state machine as firmware OTA.
+TBSoftwareState = TBFirmwareState
 
 class TBPublishInfo:
     TB_ERR_AGAIN = -1
@@ -483,7 +498,8 @@ class TBDeviceMqttClient:
     def __init__(self, host, port=1883, username=None, password=None, quality_of_service=None, client_id="",
                  chunk_size=0, messages_rate_limit="DEFAULT_MESSAGES_RATE_LIMIT",
                  telemetry_rate_limit="DEFAULT_TELEMETRY_RATE_LIMIT",
-                 telemetry_dp_rate_limit="DEFAULT_TELEMETRY_DP_RATE_LIMIT", max_payload_size=8196, on_firmware_received=None, **kwargs):
+                 telemetry_dp_rate_limit="DEFAULT_TELEMETRY_DP_RATE_LIMIT", max_payload_size=8196,
+                 on_firmware_received=None, on_software_received=None, **kwargs):
         # Added for compatibility with old versions
         if kwargs.get('rate_limit') is not None or kwargs.get('dp_rate_limit') is not None:
             messages_rate_limit = messages_rate_limit if kwargs.get('rate_limit') == "DEFAULT_RATE_LIMIT" else kwargs.get('rate_limit', messages_rate_limit) # noqa
@@ -535,11 +551,24 @@ class TBDeviceMqttClient:
             FW_STATE_ATTR: TBFirmwareState.IDLE.value,
             FW_ERROR_ATTR: ""
         }
+        self.current_software_info = {
+            "current_" + SW_TITLE_ATTR: "Initial",
+            "current_" + SW_VERSION_ATTR: "v0",
+            SW_STATE_ATTR: TBSoftwareState.IDLE.value,
+            SW_ERROR_ATTR: ""
+        }
         self.__request_id = 0
         self.__firmware_request_id = 0
+        self.__software_request_id = 0
         self.__chunk_size = chunk_size
         self.firmware_received = False
+        self.software_received = False
+        self.firmware_data = b''
+        self.software_data = b''
+        self.firmware_info = {}
+        self.software_info = {}
         self.set_on_firmware_received_function(on_firmware_received)
+        self.set_on_software_received_function(on_software_received)
         self.rate_limits_received = False
         self.__request_service_configuration_required = False
         self.__service_loop = Thread(target=self.__service_loop, name="Service loop", daemon=True)
@@ -563,11 +592,33 @@ class TBDeviceMqttClient:
 
         self.send_telemetry(self.current_firmware_info)
 
+    def update_software_info(self, title=None, version=None, state: TBSoftwareState = None, error=None):
+        if title is not None:
+            self.current_software_info["current_" + SW_TITLE_ATTR] = title
+
+        if version is not None:
+            self.current_software_info["current_" + SW_VERSION_ATTR] = version
+
+        if state is not None:
+            self.current_software_info[SW_STATE_ATTR] = state.value
+            if state is TBSoftwareState.FAILED and error is not None:
+                self.current_software_info[SW_ERROR_ATTR] = error
+            else:
+                self.current_software_info[SW_ERROR_ATTR] = ""
+
+        self.send_telemetry(self.current_software_info)
+
     def set_on_firmware_received_function(self, on_firmware_received):
         if on_firmware_received is not None:
             self.__on_firmware_received = on_firmware_received 
         else:
             self.__on_firmware_received = self.__on_firmware_received_default
+
+    def set_on_software_received_function(self, on_software_received):
+        if on_software_received is not None:
+            self.__on_software_received = on_software_received
+        else:
+            self.__on_software_received = self.__on_software_received_default
 
     def __service_loop(self):
         while not self.stopped:
@@ -577,6 +628,9 @@ class TBDeviceMqttClient:
             elif self.firmware_received:
                 self.__on_firmware_received(self, self.firmware_data, self.firmware_info.get(FW_VERSION_ATTR))
                 self.firmware_received = False
+            elif self.software_received:
+                self.__on_software_received(self, self.software_data, self.software_info.get(SW_VERSION_ATTR))
+                self.software_received = False
             sleep(0.05)
 
     def _on_publish(self, client, userdata, mid, rc=None, properties=None):
@@ -651,13 +705,24 @@ class TBDeviceMqttClient:
             log.debug("Reconnecting allowed...")
 
     def get_firmware_update(self):
-        self._client.subscribe("v2/fw/response/+")
+        self._client.subscribe("v2/fw/response/+/chunk/+")
         self.send_telemetry(self.current_firmware_info)
         self.__request_firmware_info()
+
+    def get_software_update(self):
+        self._client.subscribe("v2/sw/response/+/chunk/+")
+        self.send_telemetry(self.current_software_info)
+        self.__request_software_info()
 
     def __request_firmware_info(self):
         self.__request_id = self.__request_id + 1
         self._publish_data({"sharedKeys": REQUIRED_SHARED_KEYS},
+                           f"v1/devices/me/attributes/request/{self.__request_id}",
+                           1)
+
+    def __request_software_info(self):
+        self.__request_id = self.__request_id + 1
+        self._publish_data({"sharedKeys": REQUIRED_SW_SHARED_KEYS},
                            f"v1/devices/me/attributes/request/{self.__request_id}",
                            1)
 
@@ -696,8 +761,9 @@ class TBDeviceMqttClient:
         self.stopped = True
 
     def _on_message(self, client, userdata, message):
-        update_response_pattern = "v2/fw/response/" + str(self.__firmware_request_id) + "/chunk/"
-        if message.topic.startswith(update_response_pattern):
+        fw_update_response_pattern = "v2/fw/response/" + str(self.__firmware_request_id) + "/chunk/"
+        sw_update_response_pattern = "v2/sw/response/" + str(self.__software_request_id) + "/chunk/"
+        if message.topic.startswith(fw_update_response_pattern):
             firmware_data = message.payload
 
             self.firmware_data = self.firmware_data + firmware_data
@@ -710,11 +776,25 @@ class TBDeviceMqttClient:
                 self.__process_firmware()
             else:
                 self.__get_firmware()
+        elif message.topic.startswith(sw_update_response_pattern):
+            software_data = message.payload
+
+            self.software_data = self.software_data + software_data
+            self.__current_sw_chunk = self.__current_sw_chunk + 1
+
+            log.debug('Getting software chunk with number: %s. Chunk size is : %r byte(s).' % (
+                self.__current_sw_chunk, self.__chunk_size))
+
+            if len(self.software_data) == self.__target_software_length:
+                self.__process_software()
+            else:
+                self.__get_software()
         else:
             content = self._decode(message)
             self._on_decoded_message(content, message)
 
     def _on_decoded_message(self, content, message):
+        log.debug("Message received with topic: %s", message.topic)
         if message.topic.startswith(RPC_REQUEST_TOPIC):
             self._messages_rate_limit.increase_rate_limit_counter()
             request_id = message.topic[len(RPC_REQUEST_TOPIC):len(message.topic)]
@@ -769,25 +849,62 @@ class TBDeviceMqttClient:
 
         if message.topic.startswith("v1/devices/me/attributes"):
             self._messages_rate_limit.increase_rate_limit_counter()
-            self.firmware_info = loads(message.payload)
+            ota_attrs = loads(message.payload)
             if "/response/" in message.topic:
-                self.firmware_info = self.firmware_info.get("shared", {}) if isinstance(self.firmware_info, dict) else {} # noqa
-            if ((self.firmware_info.get(FW_VERSION_ATTR) is not None
-                and self.firmware_info.get(FW_VERSION_ATTR) != self.current_firmware_info.get("current_" + FW_VERSION_ATTR)) # noqa
-                    or (self.firmware_info.get(FW_TITLE_ATTR) is not None
-                        and self.firmware_info.get(FW_TITLE_ATTR) != self.current_firmware_info.get("current_" + FW_TITLE_ATTR))): # noqa
-                log.debug('Firmware is not the same')
-                self.firmware_data = b''
-                self.__current_chunk = 0
+                ota_attrs = ota_attrs.get("shared", {}) if isinstance(ota_attrs, dict) else {}
+            self.__handle_firmware_attributes(ota_attrs)
+            self.__handle_software_attributes(ota_attrs)
 
-                self.update_firmware_info(state = TBFirmwareState.DOWNLOADING)
-                sleep(1)
+    def __handle_firmware_attributes(self, ota_attrs):
+        if not isinstance(ota_attrs, dict):
+            return
+        for key in (FW_TITLE_ATTR, FW_VERSION_ATTR, FW_SIZE_ATTR, FW_CHECKSUM_ATTR, FW_CHECKSUM_ALG_ATTR):
+            if key in ota_attrs:
+                self.firmware_info[key] = ota_attrs[key]
+        if ((self.firmware_info.get(FW_VERSION_ATTR) is not None
+            and self.firmware_info.get(FW_VERSION_ATTR) != self.current_firmware_info.get("current_" + FW_VERSION_ATTR))
+                or (self.firmware_info.get(FW_TITLE_ATTR) is not None
+                    and self.firmware_info.get(FW_TITLE_ATTR) != self.current_firmware_info.get("current_" + FW_TITLE_ATTR))):
+            if self.firmware_info.get(FW_SIZE_ATTR) is None:
+                return
+            log.debug('Firmware is not the same')
+            self.firmware_data = b''
+            self.__current_chunk = 0
 
-                self.__firmware_request_id = self.__firmware_request_id + 1
-                self.__target_firmware_length = self.firmware_info[FW_SIZE_ATTR]
-                self.__chunk_count = 0 if not self.__chunk_size else ceil(
-                    self.firmware_info[FW_SIZE_ATTR] / self.__chunk_size)
-                self.__get_firmware()
+            self.update_firmware_info(state=TBFirmwareState.DOWNLOADING)
+            sleep(1)
+
+            self.__firmware_request_id = self.__firmware_request_id + 1
+            self.__target_firmware_length = self.firmware_info[FW_SIZE_ATTR]
+            self.__chunk_count = 0 if not self.__chunk_size else ceil(
+                self.firmware_info[FW_SIZE_ATTR] / self.__chunk_size)
+            self.__get_firmware()
+
+    def __handle_software_attributes(self, ota_attrs):
+        if not isinstance(ota_attrs, dict):
+            return
+        # Keep known software keys across partial attribute updates.
+        for key in (SW_TITLE_ATTR, SW_VERSION_ATTR, SW_SIZE_ATTR, SW_CHECKSUM_ATTR, SW_CHECKSUM_ALG_ATTR):
+            if key in ota_attrs:
+                self.software_info[key] = ota_attrs[key]
+        if ((self.software_info.get(SW_VERSION_ATTR) is not None
+            and self.software_info.get(SW_VERSION_ATTR) != self.current_software_info.get("current_" + SW_VERSION_ATTR))
+                or (self.software_info.get(SW_TITLE_ATTR) is not None
+                    and self.software_info.get(SW_TITLE_ATTR) != self.current_software_info.get("current_" + SW_TITLE_ATTR))):
+            if self.software_info.get(SW_SIZE_ATTR) is None:
+                return
+            log.debug('Software is not the same')
+            self.software_data = b''
+            self.__current_sw_chunk = 0
+
+            self.update_software_info(state=TBSoftwareState.DOWNLOADING)
+            sleep(1)
+
+            self.__software_request_id = self.__software_request_id + 1
+            self.__target_software_length = self.software_info[SW_SIZE_ATTR]
+            self.__sw_chunk_count = 0 if not self.__chunk_size else ceil(
+                self.software_info[SW_SIZE_ATTR] / self.__chunk_size)
+            self.__get_software()
 
     def __process_firmware(self):
         self.update_firmware_info(state = TBFirmwareState.DOWNLOADED)
@@ -807,12 +924,58 @@ class TBDeviceMqttClient:
             return
         self.firmware_received = True
 
+    def __process_software(self):
+        self.update_software_info(state=TBSoftwareState.DOWNLOADED)
+        sleep(1)
+
+        verification_result = verify_checksum(
+            self.software_data,
+            self.software_info.get(SW_CHECKSUM_ALG_ATTR),
+            self.software_info.get(SW_CHECKSUM_ATTR),
+        )
+
+        if verification_result:
+            log.debug('Software checksum verified!')
+            self.update_software_info(state=TBSoftwareState.VERIFIED)
+            sleep(1)
+        else:
+            log.debug('Software checksum verification failed!')
+            self.update_software_info(
+                state=TBSoftwareState.FAILED, error="Checksum verification failed!"
+            )
+            self.__request_software_info()
+            return
+        self.software_received = True
+
     def __get_firmware(self):
         payload = '' if not self.__chunk_size or self.__chunk_size > self.firmware_info.get(FW_SIZE_ATTR, 0) \
             else str(self.__chunk_size).encode()
-        self._client.publish(
+        if payload =='':
+            self._client.publish(
             f"v2/fw/request/{self.__firmware_request_id}/chunk/{self.__current_chunk}",
             payload=payload, qos=1)
+        else:
+            self._publish_data(payload, f"v2/fw/request/{self.__firmware_request_id}/chunk/{self.__current_chunk}",
+                           1)
+
+    def __get_software(self):
+        payload = (
+            ''
+            if not self.__chunk_size or self.__chunk_size > self.software_info.get(SW_SIZE_ATTR, 0)
+            else str(self.__chunk_size).encode()
+        )
+        if payload == '':
+            self._client.publish(
+                f"v2/sw/request/{self.__software_request_id}/chunk/{self.__current_sw_chunk}",
+                payload=payload,
+                qos=1,
+            )
+        else:
+            self._publish_data(
+                payload,
+                f"v2/sw/request/{self.__software_request_id}/chunk/{self.__current_sw_chunk}",
+                1,
+            )
 
     def __on_firmware_received_default(self, client, firmware_data, version_to):
         self.update_firmware_info(state = TBFirmwareState.UPDATING)
@@ -827,6 +990,16 @@ class TBDeviceMqttClient:
         self.update_firmware_info(title = self.firmware_info.get(FW_TITLE_ATTR),
                              version = self.firmware_info.get(FW_VERSION_ATTR),
                              state = TBFirmwareState.UPDATED)
+
+    def __on_software_received_default(self, client, software_data, version_to):
+        # Stay in VERIFIED: applying software is controlled by the application (e.g. RPC).
+        with open(self.software_info.get(SW_TITLE_ATTR), "wb") as software_file:
+            software_file.write(software_data)
+        log.warning(
+            f"Software was received and stored under {self.software_info.get(SW_TITLE_ATTR)}, "
+            "but 'on_software_received' callback is not defined. No OTA update applied. "
+            "Call 'set_on_software_received_function' to handle properly software update."
+        )
 
     @staticmethod
     def _decode(message):
